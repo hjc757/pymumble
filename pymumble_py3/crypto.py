@@ -286,7 +286,9 @@ def ocb_encrypt(aes: object,
     delta = xor(delta, S2(delta))
     tag = aes.encrypt(xor(delta, checksum))
 
-    return encrypted, tag
+    # Mumble 的 OCB2 是长度保持的：只发送明文长度的密文，
+    # 补零块仅参与 tag 计算，不能出现在报文里。
+    return encrypted[:len(plain)], tag
 
 
 def ocb_decrypt(aes: object,
