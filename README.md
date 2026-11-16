@@ -22,6 +22,8 @@ See you in space, cowboy.
 
 # PYMUMBLE python library
 
+> 本仓库为库本体维护版：仅包含 `pymumble_py3` 库代码与测试，不含个人机器人示例脚本。
+
 ## Description
 This library acts as a mumble client, connecting to a murmur server, exchanging states and audio.
 
@@ -229,21 +231,19 @@ with CM108PTT(gpio_pin=3, invert=True) as ptt2:
     # ...
 ```
 
-### 示例脚本运行
+### 与 Mumble 连接时启用 PTT
 
-```bash
-# 自动检测 CM108 设备
-python3 examples/example_cm108_radio.py \
-    --host mumble.example.com --port 64738 \
-    --user radio-gateway --password secret
+```python
+import pymumble_py3 as pymumble
+from pymumble_py3.cm108_ptt import CM108PTT
 
-# 手动指定设备与引脚、反转极性
-python3 examples/example_cm108_radio.py \
-    --host mumble.example.com --port 64738 \
-    --device /dev/hidraw2 --gpio-pin 3 --invert
+ptt = CM108PTT(gpio_pin=3)          # 自动检测设备，默认 GPIO3
+mumble = pymumble.Mumble(host, user="radio-gateway", password="secret")
+mumble.sound_output.ptt_controller = ptt   # 有声即发，静音 0.2s 后释放
+mumble.start()
 ```
 
-无硬件环境下脚本会打印清晰提示并进入模拟模式，不会崩溃。
+> 本库只提供库代码；配套的独立机器人/中继脚本请见 [hjc757/mumble_bot](https://github.com/hjc757/mumble_bot)。
 
 ### 注意事项
 
