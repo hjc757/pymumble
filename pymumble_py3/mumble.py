@@ -18,6 +18,7 @@ from . import tools
 from . import soundoutput
 
 from . import mumble_pb2
+from . import crypto
 
 
 class Mumble(threading.Thread):
@@ -99,6 +100,7 @@ class Mumble(threading.Thread):
         self.bandwidth = PYMUMBLE_BANDWIDTH  # reset the outgoing bandwidth to it's default before connecting
         self.server_max_bandwidth = None
         self.udp_active = False
+        self._reset_udp()
 
         # defaults according to https://wiki.mumble.info/wiki/Murmur.ini
         self.server_allow_html = True
@@ -113,6 +115,17 @@ class Mumble(threading.Thread):
 
         self.receive_buffer = bytes()  # initialize the control connection input buffer
         self.ping_stats = {"last_rcv": 0, "time_send": 0, "nb": 0, "avg": 40.0, "var": 0.0}  # Set / reset ping stats
+
+        # ---- UDP 语音通道（Mumble 1.5 protobuf + OCB2）----
+        self.crypt = None
+        self.udp_socket = None
+        self.udp_active = False
+        self.udp_ping_avg = 0.0
+        self.udp_ping_nb = 0
+        self._udp_ping_ts = 0
+        self.udp_thread = None
+        self.udp_running = False
+        self._udp_last_reply = 0
 
     def run(self):
         """Connect to the server and start the loop in its thread.  Retry if requested"""
@@ -264,6 +277,204 @@ class Mumble(threading.Thread):
         if self.ping_stats['last_rcv'] != 0 and int(time.time() * 1000) > self.ping_stats['last_rcv'] + (60 * 1000):
             self.Log.debug("Ping too long ! Disconnected ?")
             self.connected = PYMUMBLE_CONN_STATE_NOT_CONNECTED
+
+    # ------------------------------------------------------------------
+    # UDP 语音通道（Mumble >= 1.5：protobuf + OCB2-AES128）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pb_fields(data, skip=1):
+        """极简 protobuf 字段迭代，返回 (字段号, wire_type, 值)"""
+        i = skip
+        n = len(data)
+        while i < n:
+            tag = data[i]; i += 1
+            field, wt = tag >> 3, tag & 7
+            if wt == 0:
+                val, shift = 0, 0
+                while i < n:
+                    b = data[i]; i += 1
+                    val |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                yield field, wt, val
+            elif wt == 2:
+                ln, shift = 0, 0
+                while i < n:
+                    b = data[i]; i += 1
+                    ln |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                yield field, wt, bytes(data[i:i + ln])
+                i += ln
+            elif wt == 5:
+                yield field, wt, bytes(data[i:i + 4]); i += 4
+            elif wt == 1:
+                yield field, wt, bytes(data[i:i + 8]); i += 8
+            else:
+                return
+
+    @classmethod
+    def _pb_uint(cls, data, field, skip=1):
+        for f, wt, val in cls._pb_fields(data, skip):
+            if f == field and wt == 0:
+                return val
+        return 0
+
+    @classmethod
+    def _pb_bytes(cls, data, field, skip=1):
+        for f, wt, val in cls._pb_fields(data, skip):
+            if f == field and wt == 2:
+                return val
+        return None
+
+    @staticmethod
+    def _pb_varint(v):
+        out = bytearray()
+        while True:
+            b = v & 0x7F
+            v >>= 7
+            if v:
+                out.append(b | 0x80)
+            else:
+                out.append(b)
+                return bytes(out)
+
+    def _reset_udp(self):
+        """断开/重连时清空 UDP 状态，避免把旧连接的非ce/套接字带到新连接"""
+        self.udp_running = False
+        self.udp_active = False
+        self.crypt = None
+        if getattr(self, "udp_socket", None) is not None:
+            try:
+                self.udp_socket.close()
+            except Exception:
+                pass
+            self.udp_socket = None
+
+    def _udp_connect_socket(self):
+        """按 host 解析结果建 UDP 套接字（兼容 IPv4/IPv6）"""
+        infos = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_DGRAM)
+        family, socktype, proto, _, addr = infos[0]
+        sock = socket.socket(family, socktype, proto)
+        sock.connect(addr)
+        sock.settimeout(1.0)
+        return sock
+
+    def _setup_udp(self, key, client_nonce, server_nonce):
+        try:
+            cs = crypto.CryptStateOCB2()
+            cs.set_key(bytes(key), bytearray(client_nonce), bytearray(server_nonce))
+            self.crypt = cs
+            if self.udp_socket is not None:
+                try:
+                    self.udp_socket.close()
+                except Exception:
+                    pass
+            if self.udp_socket is not None:
+                try:
+                    self.udp_socket.close()
+                except Exception:
+                    pass
+            self.udp_socket = self._udp_connect_socket()
+            self.udp_running = True
+            if self.udp_thread is None or not self.udp_thread.is_alive():
+                self.udp_thread = threading.Thread(target=self._udp_loop, name="pymumble-udp", daemon=True)
+                self.udp_thread.start()
+            self.Log.info("UDP 通道已初始化（等待 ping 确认）")
+        except Exception as e:
+            self.Log.warning("UDP 初始化失败: %s" % e)
+            self.udp_active = False
+
+    def _udp_send_ping(self):
+        try:
+            ts = int(time.time() * 1000)
+            packet = b"\x01\x08" + self._pb_varint(ts)     # 1.5 protobuf Ping
+            self._udp_ping_ts = ts
+            self.udp_socket.send(self.crypt.encrypt(packet))
+        except Exception as e:
+            self.Log.debug("UDP ping 发送失败: %s" % e)
+
+    def _udp_loop(self):
+        last_ping = 0
+        while self.udp_running:
+            try:
+                if time.time() - last_ping >= 2.0:
+                    self._udp_send_ping()
+                    last_ping = time.time()
+                if self.udp_active and time.time() - self._udp_last_reply > 15:
+                    self.udp_active = False
+                    self.Log.warning("UDP 超时，语音临时回退到 TCP 隧道")
+                r, _, _ = select.select([self.udp_socket], [], [], 0.5)
+                if not r:
+                    continue
+                data = self.udp_socket.recv(2048)
+                if len(data) < 5:
+                    continue
+                plain = self.crypt.decrypt(data, len(data) - 4)
+                if not plain:
+                    continue
+                self._handle_udp_packet(plain)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not self.udp_running:
+                    break
+                self.Log.debug("UDP 收发异常: %s" % e)
+                time.sleep(0.5)
+
+    def _handle_udp_packet(self, plain):
+        if not plain:
+            return
+        mtype = plain[0]
+
+        if mtype == 1:                      # 1.5 protobuf Ping 应答
+            ts = self._pb_uint(plain, 1, 1)
+            if ts:
+                sent = getattr(self, "_udp_ping_ts", None)
+                rtt = time.time() * 1000 - sent if sent else 0
+                self.udp_ping_nb += 1
+                n = self.udp_ping_nb
+                self.udp_ping_avg = rtt if n == 1 else (self.udp_ping_avg * (n - 1) + rtt) / n
+                self._udp_last_reply = time.time()
+                if not self.udp_active:
+                    self.udp_active = True
+                    self.Log.info("UDP 通路已切通，延迟 %.0f ms" % rtt)
+            return
+
+        if mtype == 0:                      # 1.5 protobuf Audio
+            session = self._pb_uint(plain, 3, 1)
+            seq = self._pb_uint(plain, 4, 1)
+            opus = bytes(self._pb_bytes(plain, 5, 1) or b"")
+            if not opus:
+                return
+            user_entry = self.users.get(session)
+            if user_entry is None or getattr(user_entry, "sound", None) is None:
+                return
+            try:
+                newsound = user_entry.sound.add(opus, seq, PYMUMBLE_AUDIO_TYPE_OPUS, 0)
+                if newsound is not None:
+                    self.callbacks(PYMUMBLE_CLBK_SOUNDRECEIVED, user_entry, newsound)
+            except Exception as e:
+                self.Log.debug("UDP 音频处理失败: %s" % e)
+
+    def send_udp_audio(self, sequence, opus_data, terminator=False):
+        """把一帧 Opus 音频通过 UDP 发出（Mumble 1.5 protobuf Audio）"""
+        if not self.udp_active or self.crypt is None or self.udp_socket is None:
+            return False
+        try:
+            out = bytearray(b"\x00")            # protobuf Audio
+            out += b"\x08\x00"                    # target = 0（普通讲话）
+            out += b"\x20" + self._pb_varint(int(sequence) & 0xFFFFFFFFFFFFFFFF)
+            out += b"\x2a" + self._pb_varint(len(opus_data)) + opus_data
+            if terminator:
+                out += b"\x80\x01\x01"
+            self.udp_socket.send(self.crypt.encrypt(bytes(out)))
+            return True
+        except Exception as e:
+            self.Log.debug("UDP 音频发送失败: %s" % e)
+            return False
 
     def ping_response(self, mess):
         self.ping_stats['last_rcv'] = int(time.time() * 1000)
@@ -426,6 +637,14 @@ class Mumble(threading.Thread):
             mess = mumble_pb2.CryptSetup()
             mess.ParseFromString(message)
             self.Log.debug("message: CryptSetup : %s", mess)
+            if mess.HasField("key") and mess.HasField("client_nonce") and mess.HasField("server_nonce"):
+                self._setup_udp(mess.key, mess.client_nonce, mess.server_nonce)
+            elif self.crypt is not None:
+                # 服务端 resync 时可能只带其中一个 nonce，直接就地更新
+                if mess.HasField("client_nonce"):
+                    self.crypt.encrypt_iv = bytearray(mess.client_nonce)
+                if mess.HasField("server_nonce"):
+                    self.crypt.decrypt_iv = bytearray(mess.server_nonce)
             self.ping()
 
         elif type == PYMUMBLE_MSG_TYPES_CONTEXTACTIONMODIFY:
@@ -801,6 +1020,7 @@ class Mumble(threading.Thread):
         return mumble_pb2.PermissionDenied.DenyType.Name(n)
 
     def stop(self):
+        self._reset_udp()
         self.reconnect = None
         self.exit = True
         self.control_socket.close()
