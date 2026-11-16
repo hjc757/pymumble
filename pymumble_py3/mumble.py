@@ -450,10 +450,11 @@ class Mumble(threading.Thread):
             if not opus:
                 return
             user_entry = self.users.get(session)
-            if user_entry is None or getattr(user_entry, "sound", None) is None:
+            sound = self._ensure_user_sound(user_entry)
+            if sound is None:
                 return
             try:
-                newsound = user_entry.sound.add(opus, seq, PYMUMBLE_AUDIO_TYPE_OPUS, 0)
+                newsound = sound.add(opus, seq, PYMUMBLE_AUDIO_TYPE_OPUS, 0)
                 if newsound is not None:
                     self.callbacks(PYMUMBLE_CLBK_SOUNDRECEIVED, user_entry, newsound)
             except Exception as e:
@@ -762,13 +763,14 @@ class Mumble(threading.Thread):
             if size > 0 and self.receive_sound:  # if audio must be treated
                 try:
                     user_entry = self.users.get(session.value)
-                    if user_entry is None or getattr(user_entry, "sound", None) is None:
+                    sound = self._ensure_user_sound(user_entry)
+                    if sound is None:
                         # 收到未知/已移除会话的音频：直接丢弃，不能让整个接收线程崩掉
                         self.Log.debug("audio from unknown session %s, dropped", session.value)
                         pos += size
                         continue
 
-                    newsound = user_entry.sound.add(message[pos:pos + size],
+                    newsound = sound.add(message[pos:pos + size],
                                                                    sequence.value,
                                                                    type,
                                                                    target)  # add the sound to the user's sound queue
@@ -815,10 +817,31 @@ class Mumble(threading.Thread):
         """return the audio profile string"""
         return self.__opus_profile
 
+    def _ensure_user_sound(self, user_entry):
+        """确保用户对象带有 SoundQueue；开启接收音频后新老用户都能收到语音"""
+        if user_entry is None or not getattr(self, "receive_sound", False):
+            return None
+        sound = getattr(user_entry, "sound", None)
+        if sound is None:
+            try:
+                from . import soundqueue
+                user_entry.sound = soundqueue.SoundQueue(self)
+            except Exception as _e:
+                self.Log.debug("创建 SoundQueue 失败: %s" % _e)
+                return None
+            sound = user_entry.sound
+        return sound
+
     def set_receive_sound(self, value):
         """Enable or disable the management of incoming sounds"""
         if value:
             self.receive_sound = True
+            # 连接后才打开接收时，已存在的用户没有 sound 对象，补齐
+            for _user_entry in list(getattr(self.users, "items", lambda: [])()):
+                try:
+                    self._ensure_user_sound(_user_entry[1])
+                except Exception:
+                    pass
         else:
             self.receive_sound = False
 
