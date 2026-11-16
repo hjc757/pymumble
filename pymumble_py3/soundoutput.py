@@ -90,6 +90,7 @@ class SoundOutput:
                 self.sequence_last_time = self.sequence_start_time + (self.sequence * PYMUMBLE_SEQUENCE_DURATION)
 
             payload = bytearray()  # content of the whole packet, without tcptunnel header
+            payload_frames = []    # 每帧单独保留，UDP 直接发原始 Opus
             audio_encoded = 0  # audio time already in the packet
 
             while len(self.pcm) > 0 and audio_encoded < self.audio_per_packet:  # more audio to be sent and packet not full
@@ -117,6 +118,7 @@ class SoundOutput:
                     frameheader = struct.pack('!B', frameheader)
 
                 payload += frameheader + encoded  # add the frame to the packet
+                payload_frames.append(encoded)
 
             header = self.codec_type << 5  # encapsulate in audio packet
             sequence = VarInt(self.sequence).encode()
@@ -131,13 +133,23 @@ class SoundOutput:
                 len=len(udppacket)
             ))
 
-            tcppacket = struct.pack("!HL", PYMUMBLE_MSG_TYPES_UDPTUNNEL, len(udppacket)) + udppacket  # encapsulate in tcp tunnel
+            # 优先走 UDP（Mumble 1.5 protobuf）；UDP 未通时退回 TCP 隧道
+            udp_sent = False
+            if getattr(self.mumble_object, "udp_active", False):
+                try:
+                    frames = [p for p in payload_frames]
+                    udp_sent = self.mumble_object.send_udp_audio(self.sequence, b"".join(frames))
+                except Exception:
+                    udp_sent = False
 
-            while len(tcppacket) > 0:
-                sent = self.mumble_object.control_socket.send(tcppacket)
-                if sent < 0:
-                    raise socket.error("Server socket error")
-                tcppacket = tcppacket[sent:]
+            if not udp_sent:
+                tcppacket = struct.pack("!HL", PYMUMBLE_MSG_TYPES_UDPTUNNEL, len(udppacket)) + udppacket  # encapsulate in tcp tunnel
+
+                while len(tcppacket) > 0:
+                    sent = self.mumble_object.control_socket.send(tcppacket)
+                    if sent < 0:
+                        raise socket.error("Server socket error")
+                    tcppacket = tcppacket[sent:]
 
             # 记录本次发送音频的时间戳，用于 PTT hangtime 判断
             with self._ptt_lock:
