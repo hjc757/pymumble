@@ -542,7 +542,14 @@ class Mumble(threading.Thread):
 
             if size > 0 and self.receive_sound:  # if audio must be treated
                 try:
-                    newsound = self.users[session.value].sound.add(message[pos:pos + size],
+                    user_entry = self.users.get(session.value)
+                    if user_entry is None or getattr(user_entry, "sound", None) is None:
+                        # 收到未知/已移除会话的音频：直接丢弃，不能让整个接收线程崩掉
+                        self.Log.debug("audio from unknown session %s, dropped", session.value)
+                        pos += size
+                        continue
+
+                    newsound = user_entry.sound.add(message[pos:pos + size],
                                                                    sequence.value,
                                                                    type,
                                                                    target)  # add the sound to the user's sound queue

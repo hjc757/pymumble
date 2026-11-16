@@ -88,6 +88,8 @@ def _read_uevent_vidpid(hidraw_path):
 
     vid = None
     pid = None
+    hid_vid = None
+    hid_pid = None
     try:
         with open(uevent_path, "r") as f:
             for line in f:
@@ -96,9 +98,19 @@ def _read_uevent_vidpid(hidraw_path):
                     vid = line.split("=", 1)[1].strip().upper()
                 elif line.startswith("USB_PRODUCT_ID="):
                     pid = line.split("=", 1)[1].strip().upper()
+                elif line.startswith("HID_ID="):
+                    # 形如 0003:00000D8C:00000012 => bus:vid:pid
+                    parts = line.split("=", 1)[1].strip().split(":")
+                    if len(parts) == 3:
+                        hid_vid = parts[1][-4:].upper()
+                        hid_pid = parts[2][-4:].upper()
     except (IOError, OSError):
         # sysfs 读取失败（权限/不存在），当作非 CM108 设备处理
         return (None, None)
+
+    # 部分内核/设备不在 uevent 中给 USB_VENDOR_ID，退回到 HID_ID
+    if vid is None and hid_vid:
+        vid, pid = hid_vid, hid_pid
 
     return (vid, pid)
 
