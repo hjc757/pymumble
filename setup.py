@@ -24,7 +24,7 @@ setup(
     description="Mumble library used for multiple uses like making mumble bot.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url='https://github.com/azlux/pymumble',
+    url='https://github.com/hjc757/pymumble',
     license='GPLv3',
     packages=find_packages(),
     install_requires=requirements,

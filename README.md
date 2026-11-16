@@ -40,11 +40,17 @@ The wiki/API explanation is [HERE](https://github.com/azlux/pymumble/blob/pymumb
 - `pip install pymumble`
 - You need to `import pymumble_py3 as pymumble` into your code.
 
+> **中国大陆 / 本 fork 安装方式**（PyPI 上的 `pymumble` 是旧版 1.6.1，仅支持 Mumble 1.2 协议且使用 Python 3.12 已移除的 `ssl.wrap_socket`，**不要用它**）：
+> ```
+> pip install "git+https://github.com/hjc757/pymumble.git@mainline"
+> ```
+> 本 fork 支持 Mumble 1.3.x~1.6.x（TCP 模式），Python ≥ 3.10，依赖 `opuslib_next` / `protobuf` / `pycryptodome`。
+
 [![PyPI version](https://badge.fury.io/py/pymumble.svg)](https://badge.fury.io/py/pymumble)   Deployment script is available [here](https://packages.azlux.fr/scripts/pymumble.txt)
 
 ### With git
 
-- `git clone https://github.com/azlux/pymumble.git`
+- `git clone https://github.com/hjc757/pymumble.git`
 - `pip3 install -r requirements.txt`
 - You need to `import pymumble.pymumble_py3 as pymumble` into your code.
 - It's will be the same if you use a git sub-module
